@@ -1,3 +1,7 @@
-pytelegrambotapi==4.15.4
 telethon==1.33.1
-python-dotenv==1.0.1 
+python-dotenv==1.0.0
+asyncio==3.4.3
+pyTelegramBotAPI==4.14.0
+sqlite3
+logging
+datetime 

@@ -1,132 +1,100 @@
-import telebot
 from telethon import TelegramClient, events
 import asyncio
 import os
 from dotenv import load_dotenv
 import logging
-import threading
+from database import init_db
+from handlers import *
 import signal
+import sqlite3
 
-# Настройка базового логирования
-logging.basicConfig(level=logging.INFO,
-                   format='%(asctime)s - %(message)s',
-                   datefmt='%H:%M:%S')
+# Настройка логирования
+logging.basicConfig(
+    level=logging.WARNING,  # Меняем с INFO на WARNING чтобы убрать сообщения о подключении
+    format='%(message)s'    # Упрощаем формат вывода
+)
 logger = logging.getLogger(__name__)
 
-# Загружаем переменные окружения
+# Загружаем токен бота
 load_dotenv()
-
-# API данные для Telethon
-API_ID = os.getenv('API_ID')
-API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-# ID чата, куда будут пересылаться сообщения
-DESTINATION_CHAT_ID = "-1002322331895"
+async def get_bot_credentials():
+    """Получаем учетные данные бота из базы данных"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT api_id, api_hash FROM bot_credentials LIMIT 1")
+    creds = c.fetchone()
+    conn.close()
+    
+    if not creds:
+        raise ValueError("Bot credentials not found in database!")
+    return int(creds[0]), creds[1]
 
-# Инициализация ботов
-bot = telebot.TeleBot(BOT_TOKEN)
-client = TelegramClient('user_session', API_ID, API_HASH)
+# Создаем клиент бота
+bot = None  # Инициализируем позже
 
-# Проверяем чат при инициализации
-try:
-    chat_info = bot.get_chat(DESTINATION_CHAT_ID)
-    logger.info(f"Целевой чат найден: {chat_info.title} (ID: {chat_info.id})")
-except Exception as e:
-    logger.error(f"Ошибка при проверке чата: {e}")
-    logger.error("Бот не сможет отправлять сообщения. Проверьте ID чата")
-    exit(1)
-
-# Расширенный список ключевых слов
-KEYWORDS = [
-    # Массаж
-    'массаж', 'massage', 'масаж', 'массажист', 'массажистка',
-]
-
-# Флаг для отслеживания завершения
+# Флаг для отслеживания состояния работы
 running = True
 
 def signal_handler(sig, frame):
-    """Обработчик сигнала завершения"""
     global running
-    logger.info("\n🛑 Получен сигнал завершения. Закрываем соединения...")
+    logger.info("\n⌛️ Получен сигнал завершения, останавливаем бота...")
     running = False
 
-@client.on(events.NewMessage(chats=None))
-async def handler(event):
-    try:
-        # Логируем все сообщения
-        chat = await event.get_chat()
-        sender = await event.get_sender()
-        message = event.message.text if event.message.text else ''
-        
-        logger.info(f"👀 Новое сообщение в чате '{chat.title}':")
-        logger.info(f"📝 Текст: {message}")
-        
-        # Проверяем наличие ключевых слов
-        if any(keyword in message.lower() for keyword in KEYWORDS):
-            # Формируем текст для пересылки
-            forward_text = f"🔍 Найдено новое сообщение!\n\n"
-            forward_text += f"💬 Чат: {chat.title}\n"
-            
-            # Добавляем информацию об отправителе
-            sender_info = []
-            if hasattr(sender, 'first_name') and sender.first_name:
-                sender_info.append(sender.first_name)
-            if hasattr(sender, 'last_name') and sender.last_name:
-                sender_info.append(sender.last_name)
-            if hasattr(sender, 'username') and sender.username:
-                sender_info.append(f"@{sender.username}")
-            
-            forward_text += f"👤 Отправитель: {' '.join(sender_info)}\n"
-            forward_text += f"📝 Сообщение:\n{message}\n"
-            
-            # Добавляем ссылки
-            if hasattr(chat, 'username') and chat.username:
-                forward_text += f"\n🔗 Ссылка на чат: https://t.me/{chat.username}"
-            if hasattr(sender, 'username') and sender.username:
-                forward_text += f"\n👤 Профиль: https://t.me/{sender.username}"
-            
-            # Добавляем найденные ключевые слова
-            found_keywords = [kw for kw in KEYWORDS if kw in message.lower()]
-            forward_text += f"\n\n🔑 Ключевые слова: {', '.join(found_keywords)}"
-            
-            # Отправляем через telebot
-            bot.send_message(DESTINATION_CHAT_ID, forward_text)
-            logger.info(f"✅ Сообщение с ключевыми словами переслано")
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка при обработке сообщения: {e}")
+async def stop_all_clients():
+    """Останавливаем все активные клиенты"""
+    for user_id in list(active_clients.keys()):
+        await stop_client(user_id)
+    logger.info("✅ Все клиенты остановлены")
+
+def register_handlers(bot):
+    # Добавляем обработчик обычных сообщений
+    bot.add_event_handler(lambda e: message_handler(e, bot), events.NewMessage)
+    
+    # Остальные обработчики
+    bot.add_event_handler(lambda e: start_handler(e, bot), events.NewMessage(pattern='/start'))
+    bot.add_event_handler(lambda e: help_handler(e, bot), events.NewMessage(pattern='/help'))
+    bot.add_event_handler(lambda e: id_handler(e, bot), events.NewMessage(pattern='/id'))
+    bot.add_event_handler(lambda e: stop_handler(e, bot), events.NewMessage(pattern='/stop'))
+    bot.add_event_handler(lambda e: stats_handler(e, bot), events.NewMessage(pattern='/stats'))
+    bot.add_event_handler(lambda e: setchat_handler(e, bot), events.NewMessage(pattern='/setchat'))
+    bot.add_event_handler(lambda e: callback_handler(e, bot), events.CallbackQuery())
+    bot.add_event_handler(lambda e: settings_handler(e, bot), events.NewMessage(pattern='/settings'))
 
 async def main():
-    # Регистрируем обработчик Ctrl+C
+    # Регистрируем обработчик сигнала
     signal.signal(signal.SIGINT, signal_handler)
     
-    await client.start()
+    init_db()
     
-    if await client.is_user_authorized():
-        logger.info("Клиент успешно авторизован")
-        bot.send_message(DESTINATION_CHAT_ID, "🤖 Бот запущен и готов к работе!")
-        logger.info("Тестовое сообщение отправлено успешно")
-    else:
-        logger.error("Ошибка авторизации клиента")
-        return
-
+    # Получаем учетные данные и создаем бота
+    global bot
+    api_id, api_hash = await get_bot_credentials()
+    bot = TelegramClient('bot', api_id, api_hash)
+    
+    if not os.path.exists('sessions'):
+        os.makedirs('sessions')
+    
+    # Запускаем бота с токеном
+    await bot.start(bot_token=BOT_TOKEN)
+    register_handlers(bot)
+    
+    logger.info("✅ Бот успешно запущен")
+    
     try:
-        logger.info("✅ Бот успешно запущен. Для завершения нажмите Ctrl+C")
         while running:
             await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
     finally:
-        # Корректно закрываем соединения
-        await client.disconnect()
-        bot.stop_polling()
+        # Корректное завершение
+        await stop_all_clients()
+        await bot.disconnect()
         logger.info("👋 Бот успешно остановлен")
 
 if __name__ == '__main__':
-    logger.info("Запуск мониторинга...")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
